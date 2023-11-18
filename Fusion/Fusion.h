@@ -12,7 +12,7 @@
 // Includes
 
 #ifdef __cplusplus
-extern "C" {
+//extern "C" {
 #endif
 
 #include "FusionAhrs.h"
@@ -23,7 +23,7 @@ extern "C" {
 #include "FusionOffset.h"
 
 #ifdef __cplusplus
-}
+//}
 #endif
 
 #endif

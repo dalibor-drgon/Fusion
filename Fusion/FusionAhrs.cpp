@@ -19,12 +19,17 @@
 /**
  * @brief Initial gain used during the initialisation.
  */
-#define INITIAL_GAIN (10.0f)
+#define INITIAL_GAIN (50.0f)
 
 /**
  * @brief Initialisation period in seconds.
  */
-#define INITIALISATION_PERIOD (3.0f)
+#define INITIALISATION_PERIOD (1.0f)
+
+/**
+ * @brief Max error of accelerometer relative in gs
+ */
+#define MAX_ERROR (0.1f/9.81f)
 
 //------------------------------------------------------------------------------
 // Functions
@@ -88,6 +93,15 @@ void FusionAhrsSetSettings(FusionAhrs *const ahrs, const FusionAhrsSettings *con
     ahrs->rampedGainStep = (INITIAL_GAIN - ahrs->settings.gain) / INITIALISATION_PERIOD;
 }
 
+using namespace Eigen;
+
+Eigen::Matrix3f _Covariance;
+
+bool IsEnabled();
+Eigen::Matrix3f GetGyroNoise();
+Eigen::Matrix2f GetAccelGyroCovariance(Vector3f quat);
+Eigen::Vector2f GetAccelGyroDegrees(Vector3f accel);
+
 /**
  * @brief Updates the AHRS algorithm using the gyroscope, accelerometer, and
  * magnetometer measurements.
@@ -137,8 +151,15 @@ void FusionAhrsUpdate(FusionAhrs *const ahrs, const FusionVector gyroscope, cons
         // Calculate accelerometer feedback scaled by 0.5
         ahrs->halfAccelerometerFeedback = FusionVectorCrossProduct(FusionVectorNormalise(accelerometer), halfGravity);
 
+        float magnitude = FusionVectorMagnitude(accelerometer);
+        //printf("%f\n", magnitude);
+
         // Ignore accelerometer if acceleration distortion detected
-        if ((ahrs->initialising == true) || (FusionVectorMagnitudeSquared(ahrs->halfAccelerometerFeedback) <= ahrs->settings.accelerationRejection)) {
+        if ((ahrs->initialising == true) || (FusionVectorMagnitudeSquared(ahrs->halfAccelerometerFeedback) <= ahrs->settings.accelerationRejection
+#if 0
+                    && magnitude > 1.0f - MAX_ERROR && magnitude < 1.0f + MAX_ERROR
+#endif
+           )) {
             halfAccelerometerFeedback = ahrs->halfAccelerometerFeedback;
             ahrs->accelerometerIgnored = false;
             ahrs->accelerationRejectionTimer -= ahrs->accelerationRejectionTimer >= 10 ? 10 : 0;
@@ -150,44 +171,47 @@ void FusionAhrsUpdate(FusionAhrs *const ahrs, const FusionVector gyroscope, cons
     // Calculate magnetometer feedback
     FusionVector halfMagnetometerFeedback = FUSION_VECTOR_ZERO;
     ahrs->magnetometerIgnored = true;
-    if (FusionVectorIsZero(magnetometer) == false) {
-
-        // Set to compass heading if magnetic rejection times out
-        ahrs->magneticRejectionTimeout = false;
-        if (ahrs->magneticRejectionTimer > ahrs->settings.rejectionTimeout) {
-            FusionAhrsSetHeading(ahrs, FusionCompassCalculateHeading(halfGravity, magnetometer));
-            ahrs->magneticRejectionTimer = 0;
-            ahrs->magneticRejectionTimeout = true;
-        }
-
-        // Compute direction of west indicated by algorithm
-        const FusionVector halfWest = {.axis = {
-                .x = Q.x * Q.y + Q.w * Q.z,
-                .y = Q.w * Q.w - 0.5f + Q.y * Q.y,
-                .z = Q.y * Q.z - Q.w * Q.x
-        }}; // second column of transposed rotation matrix scaled by 0.5
-
-        // Calculate magnetometer feedback scaled by 0.5
-        ahrs->halfMagnetometerFeedback = FusionVectorCrossProduct(FusionVectorNormalise(FusionVectorCrossProduct(halfGravity, magnetometer)), halfWest);
-
-        // Ignore magnetometer if magnetic distortion detected
-        if ((ahrs->initialising == true) || (FusionVectorMagnitudeSquared(ahrs->halfMagnetometerFeedback) <= ahrs->settings.magneticRejection)) {
-            halfMagnetometerFeedback = ahrs->halfMagnetometerFeedback;
-            ahrs->magnetometerIgnored = false;
-            ahrs->magneticRejectionTimer -= ahrs->magneticRejectionTimer >= 10 ? 10 : 0;
-        } else {
-            ahrs->magneticRejectionTimer++;
-        }
-    }
 
     // Convert gyroscope to radians per second scaled by 0.5
     const FusionVector halfGyroscope = FusionVectorMultiplyScalar(gyroscope, FusionDegreesToRadians(0.5f));
 
+    static int rem = 100;
+    if(rem != 0) 
+        rem--;
     // Apply feedback to gyroscope
-    const FusionVector adjustedHalfGyroscope = FusionVectorAdd(halfGyroscope, FusionVectorMultiplyScalar(FusionVectorAdd(halfAccelerometerFeedback, halfMagnetometerFeedback), ahrs->rampedGain));
+    FusionVector adjustedHalfGyroscope = FusionVectorAdd(halfGyroscope, FusionVectorMultiplyScalar(FusionVectorAdd(halfAccelerometerFeedback, halfMagnetometerFeedback), ahrs->rampedGain));
+    if(rem == 0) {
+        adjustedHalfGyroscope = halfGyroscope;
+    }
 
     // Integrate rate of change of quaternion
     ahrs->quaternion = FusionQuaternionAdd(ahrs->quaternion, FusionQuaternionMultiplyVector(ahrs->quaternion, FusionVectorMultiplyScalar(adjustedHalfGyroscope, deltaTime)));
+    
+    MatrixXf H(2, 3);
+    H << 1.0f, 0.0f, 0.0f,  0.0f, 1.0f, 0.0f;
+#if 0
+    H = {
+        {1, 0, 0},
+        {0, 1, 0}
+    };
+#endif
+
+    if(rem == 0) {
+        Quaternionf quat = ToEigen(ahrs->quaternion);
+        Vector3f accel = ToEigen(accelerometer);
+        Matrix3f & Covariance = _Covariance;
+        Covariance = Covariance + quat.matrix() * GetGyroNoise();
+        
+        if(IsEnabled() && ahrs->accelerometerIgnored == false) {
+            Vector3f point = quat._transformVector(accel);
+            MatrixXf K = Covariance * H.transpose() * (H * Covariance * H.transpose() + GetAccelGyroCovariance(point)).inverse();
+            Vector3f DeltaRad = K * GetAccelGyroDegrees(point);
+            Covariance = (Matrix3f::Identity() - K * H) * Covariance;
+
+            quat = ToQuaternion(DeltaRad) * quat;
+            ahrs->quaternion = FromEigen(quat);
+        }
+    }
 
     // Normalise quaternion
     ahrs->quaternion = FusionQuaternionNormalise(ahrs->quaternion);

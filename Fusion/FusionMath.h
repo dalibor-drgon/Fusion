@@ -13,6 +13,8 @@
 #include <math.h> // M_PI, sqrtf, atan2f, asinf
 #include <stdbool.h>
 #include <stdint.h>
+#include <eigen3/Eigen/Dense>
+
 
 //------------------------------------------------------------------------------
 // Definitions
@@ -30,19 +32,42 @@ typedef union {
     } axis;
 } FusionVector;
 
+static inline Eigen::Vector3f ToEigen(FusionVector fus) {
+    return Eigen::Vector3f(fus.axis.x, fus.axis.y, fus.axis.z);
+}
+
+static inline FusionVector FromEigen(Eigen::Vector3f eig) {
+    return {eig[0], eig[1], eig[2]};
+}
+
 /**
  * @brief Quaternion.
  */
 typedef union {
     float array[4];
-
+    
     struct {
         float w;
         float x;
         float y;
         float z;
     } element;
+    
 } FusionQuaternion;
+
+static inline Eigen::Quaternionf ToEigen(FusionQuaternion fus) {
+    return Eigen::Quaternionf(fus.element.w, fus.element.x, fus.element.y, fus.element.z);
+}
+
+static inline FusionQuaternion FromEigen(Eigen::Quaternionf eig) {
+    Eigen::Vector4f coefs = eig.coeffs();
+    return {coefs[3], coefs[0], coefs[1], coefs[2]};
+}
+
+static inline Eigen::Quaternionf ToQuaternion(Eigen::Vector3f angles) {
+    Eigen::AngleAxisf axis(angles.norm(), angles.normalized());
+    return Eigen::Quaternionf((Eigen::Matrix3f) axis);
+}
 
 /**
  * @brief 3x3 matrix in row-major order.
