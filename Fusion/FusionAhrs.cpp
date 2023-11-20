@@ -102,6 +102,10 @@ Eigen::Matrix3f GetGyroNoise();
 Eigen::Matrix2f GetAccelGyroCovariance(Vector3f quat);
 Eigen::Vector2f GetAccelGyroDegrees(Vector3f accel);
 
+#include <iostream>
+#include <iomanip>
+static Eigen::IOFormat EigenCommaFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "; ", "", "", "[", "]");
+
 /**
  * @brief Updates the AHRS algorithm using the gyroscope, accelerometer, and
  * magnetometer measurements.
@@ -133,11 +137,29 @@ void FusionAhrsUpdate(FusionAhrs *const ahrs, const FusionVector gyroscope, cons
             .y = Q.y * Q.z + Q.w * Q.x,
             .z = Q.w * Q.w - 0.5f + Q.z * Q.z,
     }}; // third column of transposed rotation matrix scaled by 0.5
+    
+    #define MAXVAL 100
+    #define INC 10
+    #define DEC 2
+    static int timer = MAXVAL;
+    static Vector3f LastAcc;
 
     // Calculate accelerometer feedback
     FusionVector halfAccelerometerFeedback = FUSION_VECTOR_ZERO;
     ahrs->accelerometerIgnored = true;
+    Vector3f acc = ToEigen(accelerometer);
+
     if (FusionVectorIsZero(accelerometer) == false) {
+        if((acc - LastAcc).norm() < 1e-3) {
+            timer -= DEC;
+            if(timer < 0)
+                timer = 0;
+        } else {
+            timer += INC;
+            if(timer > MAXVAL)
+                timer = MAXVAL;
+        }
+        LastAcc = acc;
 
         // Enter acceleration recovery state if acceleration rejection times out
         if (ahrs->accelerationRejectionTimer > ahrs->settings.rejectionTimeout) {
@@ -183,9 +205,12 @@ void FusionAhrsUpdate(FusionAhrs *const ahrs, const FusionVector gyroscope, cons
     if(rem == 0) {
         adjustedHalfGyroscope = halfGyroscope;
     }
+    
+    Quaternionf quat_before = ToEigen(ahrs->quaternion);
 
     // Integrate rate of change of quaternion
     ahrs->quaternion = FusionQuaternionAdd(ahrs->quaternion, FusionQuaternionMultiplyVector(ahrs->quaternion, FusionVectorMultiplyScalar(adjustedHalfGyroscope, deltaTime)));
+    ahrs->quaternion = FusionQuaternionNormalise(ahrs->quaternion);
     
     MatrixXf H(2, 3);
     H << 1.0f, 0.0f, 0.0f,  0.0f, 1.0f, 0.0f;
@@ -195,22 +220,38 @@ void FusionAhrsUpdate(FusionAhrs *const ahrs, const FusionVector gyroscope, cons
         {0, 1, 0}
     };
 #endif
+    
+    //Matrix2f UnitK;
+    //UnitK << 1, 0, 0, 1;
 
-    if(rem == 0) {
+    if(rem == 0 && 1) {
         Quaternionf quat = ToEigen(ahrs->quaternion);
+        Quaternionf quat_rot = quat * quat_before.inverse();
         Vector3f accel = ToEigen(accelerometer);
         Matrix3f & Covariance = _Covariance;
-        Covariance = Covariance + quat.matrix() * GetGyroNoise();
+        //Covariance = quat_rot.matrix() * Covariance * quat_rot.matrix().transpose() + quat.matrix() * GetGyroNoise() * quat.matrix().transpose();
+        //std::cout << "\tDIF=" << quat_rot.matrix().eulerAngles(0, 1, 2).format(EigenCommaFormat) << std::endl;
+        Covariance = Covariance + quat.matrix() * GetGyroNoise() * quat.matrix().transpose();
         
-        if(IsEnabled() && ahrs->accelerometerIgnored == false) {
-            Vector3f point = quat._transformVector(accel);
-            MatrixXf K = Covariance * H.transpose() * (H * Covariance * H.transpose() + GetAccelGyroCovariance(point)).inverse();
-            Vector3f DeltaRad = K * GetAccelGyroDegrees(point);
-            Covariance = (Matrix3f::Identity() - K * H) * Covariance;
-
-            quat = ToQuaternion(DeltaRad) * quat;
-            ahrs->quaternion = FromEigen(quat);
+        bool calcK = false;
+        if(IsEnabled() && timer <= 10 && ahrs->accelerometerIgnored == false) {
+            calcK = true;
         }
+
+        Vector3f point = quat._transformVector(accel);
+        MatrixXf K = Covariance * H.transpose() * (H * Covariance * H.transpose() + GetAccelGyroCovariance(point)).inverse();
+        if(calcK == false)
+            K = ahrs->settings.gain * deltaTime * H.transpose();
+        VectorXf delta = GetAccelGyroDegrees(point);
+        Vector3f DeltaRad = K * delta;
+        //std::cout << "\tD=" << delta.format(EigenCommaFormat) << std::endl;
+        std::cout << std::setprecision(8);
+        std::cout << "\tK=" << K.format(EigenCommaFormat) << "\t" << DeltaRad.format(EigenCommaFormat) << std::endl;
+        Covariance = (Matrix3f::Identity() - K * H) * Covariance;
+        std::cout << std::setprecision(4);
+
+        quat = quat * ToQuaternion(DeltaRad);
+        ahrs->quaternion = FromEigen(quat);
     }
 
     // Normalise quaternion
